@@ -1,0 +1,1 @@
+mlx>=0.21mlx-nn>=0.21numpy>=1.24Pillow>=10.0regextqdmhuggingface-hubsafetensors

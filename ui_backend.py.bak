@@ -1,0 +1,363 @@
+"""
+ui_backend.py
+-------------
+Adapter layer between the Gradio/CLI front-end and the SparseEdit pipeline.
+
+This version uses LAZY imports and a mock-fallback so the UI launches even
+if the real pipeline isn't wired yet. Once you confirm the actual entry-point
+in sparse_edit/, edit `_invoke_pipeline()` and `_load_real_pipeline()` below.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import time
+import importlib
+from dataclasses import dataclass, field
+from typing import Optional, Tuple, Dict, Any, Callable
+
+import numpy as np
+from PIL import Image, ImageFilter
+
+import mlx.core as mx
+
+# Force CPU mode globally. MLX's GPU stream is thread-local and Gradio dispatches
+# handlers on a worker thread, where no GPU stream exists. CPU mode has
+# no such constraint.
+mx.set_default_device(mx.cpu)  # FORCE CPU
+
+
+# --------------------------------------------------------------------- #
+# Configuration container                                               #
+# --------------------------------------------------------------------- #
+@dataclass
+class EditRequest:
+    source_image: Image.Image
+    prompt: str
+    source_prompt: str = ""
+    num_steps: int = 30
+    guidance_scale: float = 7.5
+    lambda_sparsity: float = 0.05
+    tau: float = 0.02
+    eta: float = 0.1
+    seed: int = 0
+    height: int = 1024
+    width: int = 1024
+
+
+@dataclass
+class EditResult:
+    edited_image: Image.Image
+    metrics: Dict[str, float] = field(default_factory=dict)
+    elapsed_s: float = 0.0
+    sparsity_ratio: float = 0.0
+    backend: str = "unknown"
+
+
+# --------------------------------------------------------------------- #
+# Image <-> MLX helpers (these are safe to use right now)               #
+# --------------------------------------------------------------------- #
+def pil_to_mx(img: Image.Image, height: int, width: int) -> mx.array:
+    img = img.convert("RGB").resize((width, height), Image.LANCZOS)
+    arr = np.asarray(img, dtype=np.float32) / 127.5 - 1.0
+    arr = arr[None, ...]
+    return mx.array(arr, dtype=mx.float32)
+
+
+def mx_to_pil(arr: mx.array) -> Image.Image:
+    a = np.array(arr)
+    if a.ndim == 4:
+        a = a[0]
+    a = ((a + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
+    return Image.fromarray(a)
+
+
+# --------------------------------------------------------------------- #
+# Lazy + defensive pipeline loading                                     #
+# --------------------------------------------------------------------- #
+_PIPELINE: Optional[Any] = None
+_BACKEND: str = "uninitialized"
+
+
+def _try_import(module_path: str, attr: str) -> Optional[Any]:
+    """Try to import `attr` from `module_path`. Return None on failure."""
+    try:
+        mod = importlib.import_module(module_path)
+        return getattr(mod, attr, None)
+    except Exception as e:
+        print(f"[ui_backend] could not import {module_path}.{attr}: {e}")
+        return None
+
+
+# --------------------------------------------------------------------- #
+# Real pipeline loader — instantiates all four sub-models and assembles #
+# --------------------------------------------------------------------- #
+def _load_real_pipeline(weights_dir: str) -> Optional[Any]:
+    """
+    Construct SparseEditPipeline by building each sub-model and passing
+    them in. We try multiple loader conventions per model and surface a
+    clean error if none succeed.
+    """
+    try:
+        from sparse_edit.editing.pipeline import (
+            SparseEditPipeline,
+            PipelineConfig,
+        )
+        from sparse_edit.models.text_encoder import CLIPTextEncoder
+        from sparse_edit.models.vae import VAEEncoder, VAEDecoder
+        from sparse_edit.models.unet import UNet
+    except Exception as e:
+        print(f"[ui_backend] core imports failed: {e}")
+        import traceback; traceback.print_exc()
+        return None
+
+    def _try_build(cls, name: str) -> Optional[Any]:
+        """Try several common loader conventions on a model class."""
+        attempts = [
+            ("from_pretrained(weights_dir)",
+             lambda: cls.from_pretrained(weights_dir)),
+            ("from_pretrained()",
+             lambda: cls.from_pretrained()),
+            ("(weights_dir)",
+             lambda: cls(weights_dir)),
+            ("()",
+             lambda: cls()),
+        ]
+        for label, fn in attempts:
+            try:
+                inst = fn()
+                print(f"[ui_backend]   built {name} via {label}")
+                return inst
+            except Exception as e:
+                last_err = f"{type(e).__name__}: {e}"
+                continue
+        print(f"[ui_backend]   could not build {name}; last error: {last_err}")
+        return None
+
+    print("[ui_backend] Building sub-models ...")
+    text_enc = _try_build(CLIPTextEncoder, "CLIPTextEncoder")
+    vae_enc  = _try_build(VAEEncoder,      "VAEEncoder")
+    vae_dec  = _try_build(VAEDecoder,      "VAEDecoder")
+    unet     = _try_build(UNet,            "UNet")
+
+    if any(x is None for x in (text_enc, vae_enc, vae_dec, unet)):
+        print("[ui_backend] One or more sub-models failed to build. "
+              "Real pipeline unavailable; falling back to mock.")
+        return None
+
+    try:
+        cfg = PipelineConfig()
+        pipe = SparseEditPipeline(
+            text_encoder=text_enc,
+            vae_encoder=vae_enc,
+            vae_decoder=vae_dec,
+            unet=unet,
+            config=cfg,
+        )
+        print("[ui_backend] SparseEditPipeline assembled successfully.")
+        return pipe
+    except Exception as e:
+        print(f"[ui_backend] SparseEditPipeline assembly failed: {e}")
+        import traceback; traceback.print_exc()
+        return None
+
+
+
+def get_pipeline(weights_dir: str = "weights-sdxl-15") -> Tuple[Any, str]:
+    """
+    Returns (pipeline_or_None, backend_name).
+    backend_name is "real" if your SparseEdit pipeline loaded, else "mock".
+    """
+    global _PIPELINE, _BACKEND
+    if _BACKEND != "uninitialized":
+        return _PIPELINE, _BACKEND
+
+    print(f"[ui_backend] Attempting to load real pipeline from '{weights_dir}'...")
+    t0 = time.time()
+    pipe = _load_real_pipeline(weights_dir)
+    if pipe is not None:
+        _PIPELINE = pipe
+        _BACKEND = "real"
+        print(f"[ui_backend] Real pipeline ready in {time.time() - t0:.1f}s")
+    else:
+        _PIPELINE = None
+        _BACKEND = "mock"
+        print("[ui_backend] ⚠️  Real pipeline not found — running in MOCK mode.")
+        print("[ui_backend]    The UI will work but produce a placeholder edit.")
+    return _PIPELINE, _BACKEND
+
+
+# --------------------------------------------------------------------- #
+# Mock pipeline so the UI is testable without weights wired             #
+# --------------------------------------------------------------------- #
+def _mock_edit(source: Image.Image, prompt: str, req: EditRequest,
+               progress_cb: Optional[Callable]) -> Dict[str, Any]:
+    """
+    Produces a visibly-modified placeholder so you can verify the UI loop.
+    Applies a mild blur + tint as a stand-in for a real edit.
+    """
+    total = req.num_steps
+    for i in range(total):
+        time.sleep(0.02)
+        if progress_cb:
+            progress_cb(i + 1, total)
+
+    img = source.convert("RGB").resize((req.width, req.height), Image.LANCZOS)
+    img = img.filter(ImageFilter.GaussianBlur(radius=1.2))
+    arr = np.asarray(img, dtype=np.float32)
+    # Tiny warm tint so user sees something changed
+    arr[..., 0] = np.clip(arr[..., 0] * 1.05, 0, 255)
+    arr[..., 2] = np.clip(arr[..., 2] * 0.95, 0, 255)
+    edited = Image.fromarray(arr.astype(np.uint8))
+
+    return {
+        "edited_image_pil": edited,
+        "sparsity_ratio": 0.0,
+    }
+
+
+# --------------------------------------------------------------------- #
+# Real pipeline invocation — calls pipe.edit() with the right kwargs    #
+# --------------------------------------------------------------------- #
+def _invoke_pipeline(pipe: Any, source_mx: mx.array, req: EditRequest,
+                     progress_cb: Optional[Callable]) -> Dict[str, Any]:
+    """
+    Invokes SparseEditPipeline.edit() with the signature confirmed from
+    sparse_edit/editing/pipeline.py:
+        edit(source_image, source_prompt, target_prompt, mask=None) -> EditResult
+    """
+    if not hasattr(pipe, "edit"):
+        raise RuntimeError(
+            "Loaded pipeline has no .edit() method. Did the class change?"
+        )
+
+    # The pipeline accepts NHWC float MLX arrays OR HWC uint8 NumPy arrays.
+    # We pass the MLX array we already prepared in edit_image().
+    result = pipe.edit(
+        source_image=source_mx,
+        source_prompt=req.source_prompt or "a photo",
+        target_prompt=req.prompt,
+    )
+
+    # SparseEditPipeline.edit() returns an EditResult dataclass.
+    # Extract the edited image regardless of which attribute name it uses.
+    edited = None
+    sparsity = 0.0
+    for attr in ("edited_image", "image", "output", "sample"):
+        if hasattr(result, attr):
+            edited = getattr(result, attr)
+            break
+    if edited is None and isinstance(result, dict):
+        edited = result.get("edited_image") or result.get("image")
+
+    for attr in ("sparsity_ratio", "sparsity"):
+        if hasattr(result, attr):
+            sparsity = float(getattr(result, attr))
+            break
+
+    if edited is None:
+        raise RuntimeError(
+            f"Could not extract edited image from EditResult. "
+            f"Available attrs: {[a for a in dir(result) if not a.startswith('_')]}"
+        )
+
+    return _normalize_output({"edited_image": edited,
+                              "sparsity_ratio": sparsity})
+
+
+def _normalize_output(out: Any) -> Dict[str, Any]:
+    """Coerce whatever the real pipeline returns into a common dict shape."""
+    if isinstance(out, dict):
+        img = out.get("edited_image") or out.get("image") or out.get("sample")
+        sparsity = float(out.get("sparsity_ratio", 0.0))
+    elif isinstance(out, mx.array):
+        img, sparsity = out, 0.0
+    elif isinstance(out, tuple) and len(out) >= 1:
+        img = out[0]
+        sparsity = float(out[1]) if len(out) > 1 else 0.0
+    else:
+        img, sparsity = out, 0.0
+
+    if isinstance(img, mx.array):
+        img_pil = mx_to_pil(img)
+    elif isinstance(img, np.ndarray):
+        a = img
+        if a.ndim == 4:
+            a = a[0]
+        if a.dtype != np.uint8:
+            a = ((a + 1.0) * 127.5).clip(0, 255).astype(np.uint8) \
+                if a.min() < 0 else a.clip(0, 255).astype(np.uint8)
+        img_pil = Image.fromarray(a)
+    elif isinstance(img, Image.Image):
+        img_pil = img
+    else:
+        raise TypeError(f"Unrecognized pipeline image output type: {type(img)}")
+
+    return {"edited_image_pil": img_pil, "sparsity_ratio": sparsity}
+
+
+# --------------------------------------------------------------------- #
+# THE function the UI calls                                             #
+# --------------------------------------------------------------------- #
+def edit_image(req: EditRequest,
+               progress_cb: Optional[Callable] = None) -> EditResult:
+    # Re-assert CPU device on every call. Idempotent and cheap.
+    mx.set_default_device(mx.cpu)
+
+    pipe, backend = get_pipeline()
+
+    mx.random.seed(req.seed)
+
+    t0 = time.time()
+    if backend == "real":
+        source_mx = pil_to_mx(req.source_image, req.height, req.width)
+        out = _invoke_pipeline(pipe, source_mx, req, progress_cb)
+    else:
+        out = _mock_edit(req.source_image, req.prompt, req, progress_cb)
+    elapsed = time.time() - t0
+
+    edited_pil = out["edited_image_pil"]
+    sparsity = float(out.get("sparsity_ratio", 0.0))
+
+    metrics = _safe_metrics(req.source_image, edited_pil, req.prompt,
+                            req.height, req.width, sparsity)
+
+    return EditResult(
+        edited_image=edited_pil,
+        metrics=metrics,
+        elapsed_s=elapsed,
+        sparsity_ratio=sparsity,
+        backend=backend,
+    )
+
+
+# --------------------------------------------------------------------- #
+# Defensive metric loading                                              #
+# --------------------------------------------------------------------- #
+def _safe_metrics(src_pil: Image.Image, edt_pil: Image.Image, prompt: str,
+                  H: int, W: int, sparsity: float) -> Dict[str, float]:
+    metrics: Dict[str, float] = {"Sparsity": sparsity}
+    try:
+        src_np = np.array(src_pil.convert("RGB").resize((W, H), Image.LANCZOS),
+                          dtype=np.float32)
+        edt_np = np.array(edt_pil.convert("RGB").resize((W, H), Image.LANCZOS),
+                          dtype=np.float32)
+
+        # Inline PSNR/SSIM so we don't depend on evaluation.py until confirmed
+        mse = float(np.mean((src_np - edt_np) ** 2))
+        metrics["PSNR_bg"] = 99.0 if mse < 1e-8 else \
+            float(20.0 * np.log10(255.0 / np.sqrt(mse)))
+
+        # Simple SSIM proxy (luminance correlation) — replace with real one later
+        s = src_np.mean(-1).flatten()
+        e = edt_np.mean(-1).flatten()
+        s = (s - s.mean()) / (s.std() + 1e-8)
+        e = (e - e.mean()) / (e.std() + 1e-8)
+        metrics["SSIM_bg"] = float(np.clip(np.mean(s * e), 0.0, 1.0))
+
+        metrics["Leakage"] = float(mse / (255.0 ** 2))
+        metrics["CLIP_score"] = float("nan")  # filled in once real eval is wired
+    except Exception as e:
+        metrics["error"] = f"metric_compute_failed: {e}"
+    return metrics
